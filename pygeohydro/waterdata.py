@@ -608,6 +608,166 @@ class NWIS:
             return self._to_xarray(qobs, long_names, mmd)
         return qobs
 
+    def _get_gageheight(
+        self,
+        sids: Sequence[str],
+        start_dt: str,
+        end_dt: str,
+        freq: str,
+        kwargs: dict[str, str],
+    ) -> pd.DataFrame:
+        """Convert json to dataframe."""
+        payloads = [
+            {
+                "sites": ",".join(s),
+                "startDT": start_dt,
+                "endDT": end_dt,
+                **kwargs,
+            }
+            for s in tlz.partition_all(1500, sids)
+        ]
+        resp = ar.retrieve_json(
+            [f"{self.url}/{freq}"] * len(payloads), [{"params": p} for p in payloads]
+        )
+
+        def get_site_id(site_cd: dict[str, str]) -> str:
+            """Get site id."""
+            return f"{site_cd['agencyCode']}-{site_cd['value']}"
+
+        r_ts = {
+            get_site_id(t["sourceInfo"]["siteCode"][0]): t["values"][0]["value"]
+            for r in resp
+            for t in r["value"]["timeSeries"]
+        }
+        if not r_ts:
+            raise DataNotAvailableError("gage")
+
+        def to_df(col: str, values: dict[str, Any]) -> pd.DataFrame:
+            try:
+                gageheight = pd.DataFrame.from_records(
+                    values, exclude=["qualifiers"], index=["dateTime"]
+                )
+            except KeyError:
+                return pd.DataFrame()
+            gageheight["value"] = pd.to_numeric(gageheight["value"], errors="coerce")
+            tz = resp[0]["value"]["timeSeries"][0]["sourceInfo"]["timeZoneInfo"]
+            tz_dict = {
+                "CST": "US/Central",
+                "MST": "US/Mountain",
+                "PST": "US/Pacific",
+                "EST": "US/Eastern",
+            }
+            time_zone = tz_dict.get(
+                tz["defaultTimeZone"]["zoneAbbreviation"],
+                tz["defaultTimeZone"]["zoneAbbreviation"],
+            )
+            gageheight.index = [pd.Timestamp(i, tz=time_zone) for i in gageheight.index]
+            gageheight.index = gageheight.index.tz_convert("UTC")  # type: ignore[attr-defined]
+            gageheight.columns = [col]
+            return gageheight
+
+        qobs = pd.concat(itertools.starmap(to_df, r_ts.items()), axis=1)
+        if len(qobs) == 0:
+            raise DataNotAvailableError("gage")
+        qobs[qobs.le(0)] = np.nan
+
+        return qobs
+
+    def get_gageheight(
+        self,
+        station_ids: Sequence[str] | str,
+        dates: tuple[str, str],
+        freq: str = "dv",
+        to_xarray: bool = False,
+    ) -> pd.DataFrame | xr.Dataset:
+        """Get mean daily gage height observations from USGS.
+
+        Parameters
+        ----------
+        station_ids : str, list
+            The gage ID(s)  of the USGS station.
+        dates : tuple
+            Start and end dates as a tuple (start, end).
+        freq : str, optional
+            The frequency of the streamflow data, defaults to ``dv`` (daily values).
+            Valid frequencies are ``dv`` (daily values), ``iv`` (instantaneous values).
+            Note that for ``iv`` the time zone for the input dates is assumed to be UTC.
+        to_xarray : bool, optional
+            Whether to return a xarray.Dataset. Defaults to False.
+
+        Returns
+        -------
+        pandas.DataFrame or xarray.Dataset
+            Gage height observations in feet. The stations that
+            don't provide the requested gage data in the target period will be dropped.
+            Note that when frequency is set to ``iv`` the time zone is converted to UTC.
+        """
+        valid_freqs = ["dv", "iv"]
+        if freq not in valid_freqs:
+            raise InputValueError("freq", valid_freqs)
+        utc = True if freq == "iv" else None
+
+        sids, start, end = self._check_inputs(station_ids, dates, utc)
+
+        queries = [
+            {
+                "parameterCd": "00065",
+                "siteStatus": "all",
+                "outputDataTypeCd": freq,
+                "sites": ",".join(s),
+                "startDt": start.strftime("%Y-%m-%d"),
+                "endDt": end.strftime("%Y-%m-%d"),
+            }
+            for s in tlz.partition_all(1500, sids)
+        ]
+
+        try:
+            siteinfo = self.get_info(queries)
+        except ZeroMatchedError as ex:
+            raise DataNotAvailableError("gage") from ex
+
+        params = {
+            "format": "json",
+            "parameterCd": "00065",
+            "siteStatus": "all",
+        }
+        if freq == "dv":
+            params.update({"statCd": "00003"})
+            siteinfo = siteinfo[
+                (siteinfo.stat_cd == "00003")
+                & (siteinfo.parm_cd == "00065")
+                & (start.tz_localize(None) < siteinfo.end_date)
+                & (end.tz_localize(None) > siteinfo.begin_date)
+            ]
+        else:
+            siteinfo = siteinfo[
+                (siteinfo.parm_cd == "00065")
+                & (start.tz_localize(None) < siteinfo.end_date)
+                & (end.tz_localize(None) > siteinfo.begin_date)
+            ]
+        sids = list(siteinfo.site_no.unique())
+        if not sids:
+            raise DataNotAvailableError("gage")
+
+        time_fmt = T_FMT if utc is None else "%Y-%m-%dT%H:%M%z"
+        start_dt = start.strftime(time_fmt)
+        end_dt = end.strftime(time_fmt)
+        qobs = self._get_gageheight(sids, start_dt, end_dt, freq, params)
+
+        n_orig = len(sids)
+        sids = [s.split("-")[1] for s in qobs]
+        if len(sids) != n_orig:
+            logger.warning(
+                f"Dropped {n_orig - len(sids)} stations since they don't have gage data"
+                + f" from {start_dt} to {end_dt}."
+            )
+        siteinfo = siteinfo[siteinfo.site_no.isin(sids)]
+        # qobs.attrs, long_names = self._get_attrs(siteinfo, mmd)
+        # if to_xarray:
+        #     return self._to_xarray(qobs, long_names, mmd)
+        return qobs
+
+
 
 class WaterQuality:
     """Water Quality Web Service https://www.waterqualitydata.us.
